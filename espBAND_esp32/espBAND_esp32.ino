@@ -16,16 +16,18 @@
 
 #define SERVICE_UUID       "aae42004-acfa-487a-835c-1e9ce04f0c44"
 #define SERVICE_TIME_UUID       "3bf4d21b-645f-4c68-9ff2-f42b35ec4a41"
+#define SERVICE_DATE_UUID       "4cf4d21b-645f-4c68-9ff2-f42b35ec4a41"
 
 // Android -> ESP32
 #define TIME_CHAR_UUID    "ef95cac9-9cf2-4d9a-ace4-4f6d6b66d74b"
+#define DATE_CHAR_UUID    "ff95cac9-9cf2-4d9a-ace4-4f6d6b66d74b"
 #define TRACK_CHAR_UUID    "11111111-1111-1111-1111-111111111111"
 
 // ESP32 -> Android
 #define CONTROL_CHAR_UUID  "22222222-2222-2222-2222-222222222222"
 
 // ======================================================
-// BUTTON PINS
+// BUTTON PINS & DEBOUNCE
 // ======================================================
 
 #define RIGHT_BTN   27
@@ -33,16 +35,35 @@
 #define CONFIRM_BTN 12
 #define BACK_BTN    13
 
-// ======================================================
-// DEBOUNCE
-// ======================================================
+#define DEBOUNCE_TIME 50  // ms settling time
 
-#define DEBOUNCE_MS 200
+// Button indices for arrays
+enum ButtonIdx { BTN_RIGHT, BTN_LEFT, BTN_CONFIRM, BTN_BACK, BTN_COUNT };
+const uint8_t buttonPins[BTN_COUNT] = { RIGHT_BTN, LEFT_BTN, CONFIRM_BTN, BACK_BTN };
 
-uint32_t lastRightPress   = 0;
-uint32_t lastLeftPress    = 0;
-uint32_t lastConfirmPress = 0;
-uint32_t lastBackPress    = 0;
+bool     buttonState[BTN_COUNT];       // Current stable state (true = pressed/LOW)
+bool     lastButtonState[BTN_COUNT];   // State from previous loop
+uint32_t lastDebounceTime[BTN_COUNT];  // Last time the hardware pin changed
+bool     justPressed[BTN_COUNT];       // True for one loop when pressed
+
+void updateButtons() {
+  for (int i = 0; i < BTN_COUNT; i++) {
+    bool rawReading = !digitalRead(buttonPins[i]); // Active LOW
+    justPressed[i] = false;
+
+    if (rawReading != lastButtonState[i]) {
+      lastDebounceTime[i] = millis();
+    }
+
+    if ((millis() - lastDebounceTime[i]) > DEBOUNCE_TIME) {
+      if (rawReading != buttonState[i]) {
+        buttonState[i] = rawReading;
+        if (buttonState[i]) justPressed[i] = true;
+      }
+    }
+    lastButtonState[i] = rawReading;
+  }
+}
 
 // ======================================================
 // OLED
@@ -236,6 +257,19 @@ const int MENU_COUNT = sizeof(menuItems) / sizeof(menuItems[0]);
 int menuIndex = 0;
 
 // ======================================================
+// MENU ANIMATION GLOBALS
+// ======================================================
+
+int      animOffsetX      = 0;
+int      lastMenuIndex    = 0;
+bool     isAnimating      = false;
+int      animDirection    = 0; // 1 for right (next), -1 for left (prev)
+uint32_t lastAnimFrameTime = 0;
+
+#define ANIM_STEP_PX      16    // Pixels to move per frame
+#define ANIM_FRAME_MS     10    // Target 100fps (limited by I2C/OLED)
+
+// ======================================================
 // SETTINGS
 // ======================================================
 
@@ -264,6 +298,7 @@ int      inactRepeatCount = 0;
 String currentTrack   = "No Track";
 String playbackState  = "PAUSED";
 String currentTime    = "";
+String currentDate    = "";
 
 // ======================================================
 // BLE GLOBALS
@@ -274,6 +309,7 @@ bool deviceConnected = false;
 BLECharacteristic* trackCharacteristic;
 BLECharacteristic* controlCharacteristic;
 BLECharacteristic* timeCharacteristic;
+BLECharacteristic* dateCharacteristic;
 
 // ======================================================
 // FLAG: tells loop() to refresh the screen
@@ -357,35 +393,15 @@ void drawHomeScreen() {
     (currentTime.length() > 0) ? currentTime.c_str() : DEVICE_NAME;
 
   int tw = u8g2.getStrWidth(title);
-  u8g2.drawStr((128 - tw) / 2, 24, title);
+  u8g2.drawStr((128 - tw) / 2, 28, title);
 
-  // ---- Connection status ----
+  // ---- Date (centered below time) ----
 
-  u8g2.setFont(u8g2_font_ncenB08_tr);
-
-  const char* status =
-    deviceConnected ? "Connected" : "Disconnected";
-
-  int sw = u8g2.getStrWidth(status);
-  u8g2.drawStr((128 - sw) / 2, 40, status);
-
-  // ---- Track name if connected (scrolling) ----
-
-  if (deviceConnected) {
-
-    checkScrollReset();
-
+  if (currentDate.length() > 0) {
     u8g2.setFont(u8g2_font_ncenB08_tr);
-    drawScrollingText(currentTrack.c_str(), 52);
+    int dw = u8g2.getStrWidth(currentDate.c_str());
+    u8g2.drawStr((128 - dw) / 2, 48, currentDate.c_str());
   }
-
-  // ---- Hint ----
-
-  u8g2.setFont(u8g2_font_5x7_tr);
-
-  const char* hint = "Press OK";
-  int hw = u8g2.getStrWidth(hint);
-  u8g2.drawStr((128 - hw) / 2, 63, hint);
 
   u8g2.sendBuffer();
 }
@@ -394,36 +410,46 @@ void drawHomeScreen() {
 // DISPLAY – MENU SCREEN
 // ======================================================
 
+void drawSingleMenuItem(int index, int xOffset) {
+  if (index < 0 || index >= MENU_COUNT) return;
+
+  // ---- Icon (32x32) ----
+  const uint8_t* icon = menuItems[index].icon;
+  u8g2.drawXBMP(xOffset + 48, 4, 32, 32, icon);
+
+  // ---- Label ----
+  u8g2.setFont(u8g2_font_ncenB10_tr);
+  const char* label = menuItems[index].label;
+  int lw = u8g2.getStrWidth(label);
+  u8g2.drawStr(xOffset + (128 - lw) / 2, 52, label);
+}
+
 void drawMenuScreen() {
 
   u8g2.clearBuffer();
 
-  // ---- Icon (32x32 centred) ----
+  if (isAnimating) {
+    // Draw current (entering)
+    drawSingleMenuItem(menuIndex, animOffsetX);
+    // Draw previous (leaving)
+    drawSingleMenuItem(lastMenuIndex, animOffsetX - (128 * animDirection));
+  } else {
+    drawSingleMenuItem(menuIndex, 0);
+  }
 
-  const uint8_t* icon = menuItems[menuIndex].icon;
-  u8g2.drawXBMP(48, 4, 32, 32, icon);
+  // ---- Left arrow (Static) ----
 
-  // ---- Label centred below icon ----
-
-  u8g2.setFont(u8g2_font_ncenB10_tr);
-
-  const char* label = menuItems[menuIndex].label;
-  int lw = u8g2.getStrWidth(label);
-  u8g2.drawStr((128 - lw) / 2, 52, label);
-
-  // ---- Left arrow (drawn triangle) ----
-
-  if (menuIndex > 0) {
+  if (menuIndex > 0 || (isAnimating && (menuIndex > 0 || lastMenuIndex > 0))) {
     u8g2.drawTriangle(10, 20, 2, 24, 10, 28);
   }
 
-  // ---- Right arrow (drawn triangle) ----
+  // ---- Right arrow (Static) ----
 
-  if (menuIndex < MENU_COUNT - 1) {
+  if (menuIndex < MENU_COUNT - 1 || (isAnimating && (menuIndex < MENU_COUNT - 1 || lastMenuIndex < MENU_COUNT - 1))) {
     u8g2.drawTriangle(118, 20, 126, 24, 118, 28);
   }
 
-  // ---- Page indicator dots ----
+  // ---- Page indicator dots (Static) ----
 
   if (MENU_COUNT > 1) {
 
@@ -559,6 +585,22 @@ class TimeCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+class DateCallbacks : public BLECharacteristicCallbacks {
+
+  void onWrite(BLECharacteristic* pCharacteristic) {
+
+    String value = pCharacteristic->getValue();
+    if (value.length() > 0) {
+
+      Serial.print("Date Received: ");
+      Serial.println(value);
+
+      currentDate  = value;
+      displayDirty = true;
+    }
+  }
+};
+
 class TrackCallbacks : public BLECharacteristicCallbacks {
 
   void onWrite(BLECharacteristic* pCharacteristic) {
@@ -596,24 +638,6 @@ class TrackCallbacks : public BLECharacteristicCallbacks {
 };
 
 // ======================================================
-// BUTTON HELPERS
-// ======================================================
-
-bool btnPressed(int pin, uint32_t &lastPress) {
-
-  if (!digitalRead(pin)) {
-
-    if (millis() - lastPress > DEBOUNCE_MS) {
-
-      lastPress = millis();
-      return true;
-    }
-  }
-
-  return false;
-}
-
-// ======================================================
 // SETUP
 // ======================================================
 
@@ -636,7 +660,7 @@ void setup() {
   // I2C
   // ====================================================
 
-  Wire.begin(22, 21);
+  Wire.begin(21, 22);
 
   // ====================================================
   // OLED INIT
@@ -665,8 +689,11 @@ void setup() {
   pServer->setCallbacks(new MyServerCallbacks());
 
   BLEService* pService = pServer->createService(SERVICE_UUID);
-  
+  delay(100);
   BLEService* pTimeService = pServer->createService(SERVICE_TIME_UUID);
+  delay(100);
+  BLEService* pDateService = pServer->createService(SERVICE_DATE_UUID);
+  delay(100);
 
   // ====================================================
   // TRACK CHARACTERISTIC
@@ -687,12 +714,22 @@ void setup() {
       BLECharacteristic::PROPERTY_WRITE |
       BLECharacteristic::PROPERTY_READ
     );
+  dateCharacteristic =
+    pDateService->createCharacteristic(
+      DATE_CHAR_UUID,
+
+      BLECharacteristic::PROPERTY_WRITE |
+      BLECharacteristic::PROPERTY_READ
+    );
 
   trackCharacteristic->setCallbacks(
     new TrackCallbacks()
   );
   timeCharacteristic->setCallbacks(
     new TimeCallbacks()
+  );
+  dateCharacteristic->setCallbacks(
+    new DateCallbacks()
   );
 
   BLE2901* trackDesc = new BLE2901();
@@ -706,6 +743,12 @@ void setup() {
   timeDesc->setDescription("Time Information");
 
   timeCharacteristic->addDescriptor(timeDesc);
+
+  BLE2901* dateDesc = new BLE2901();
+
+  dateDesc->setDescription("Date Information");
+
+  dateCharacteristic->addDescriptor(dateDesc);
 
   // ====================================================
   // CONTROL CHARACTERISTIC
@@ -735,6 +778,7 @@ void setup() {
 
   pService->start();
   pTimeService->start();
+  pDateService->start();
 
   // ====================================================
   // START ADVERTISING
@@ -745,6 +789,7 @@ void setup() {
 
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->addServiceUUID(SERVICE_TIME_UUID);
+  pAdvertising->addServiceUUID(SERVICE_DATE_UUID);
 
   pAdvertising->start();
 
@@ -886,20 +931,20 @@ void drawPlaceholderScreen(const char* title) {
 void loop() {
 
   // ====================================================
-  // READ BUTTONS  (debounced taps)
+  // UPDATE DEBOUNCED BUTTON STATES
   // ====================================================
 
-  bool right   = btnPressed(RIGHT_BTN,   lastRightPress);
-  bool left    = btnPressed(LEFT_BTN,    lastLeftPress);
-  bool confirm = btnPressed(CONFIRM_BTN, lastConfirmPress);
-  bool back    = btnPressed(BACK_BTN,    lastBackPress);
+  updateButtons();
 
-  // ---- Reset inactivity timer on any button press ----
+  bool right   = justPressed[BTN_RIGHT];
+  bool left    = justPressed[BTN_LEFT];
+  bool confirm = justPressed[BTN_CONFIRM];
+  bool back    = justPressed[BTN_BACK];
 
-  if (right || left || confirm || back
-      || !digitalRead(RIGHT_BTN) || !digitalRead(LEFT_BTN)
-      || !digitalRead(CONFIRM_BTN) || !digitalRead(BACK_BTN)) {
+  // ---- Reset inactivity timer on any debounced button interaction ----
 
+  if (buttonState[BTN_RIGHT] || buttonState[BTN_LEFT] || 
+      buttonState[BTN_CONFIRM] || buttonState[BTN_BACK]) {
     lastActivityTime = millis();
   }
 
@@ -911,9 +956,9 @@ void loop() {
 
   if (currentState == STATE_MUSIC) {
 
-    // ---- RIGHT button ----
+    // ---- RIGHT button (Debounced) ----
 
-    if (!digitalRead(RIGHT_BTN)) {
+    if (buttonState[BTN_RIGHT]) {
 
       if (rightPressStart == 0) {
         rightPressStart = millis();
@@ -943,9 +988,9 @@ void loop() {
       }
     }
 
-    // ---- LEFT button ----
+    // ---- LEFT button (Debounced) ----
 
-    if (!digitalRead(LEFT_BTN)) {
+    if (buttonState[BTN_LEFT]) {
 
       if (leftPressStart == 0) {
         leftPressStart = millis();
@@ -1017,39 +1062,45 @@ void loop() {
 
   else if (currentState == STATE_MENU) {
 
-    if (right && menuIndex < MENU_COUNT - 1) {
+    if (!isAnimating) {
+      if (right && menuIndex < MENU_COUNT - 1) {
+        lastMenuIndex = menuIndex;
+        menuIndex++;
+        animDirection = 1;
+        animOffsetX   = 128;
+        isAnimating   = true;
+        displayDirty  = true;
 
-      menuIndex++;
-      displayDirty = true;
+        Serial.print("Menu -> ");
+        Serial.println(menuItems[menuIndex].label);
+      }
 
-      Serial.print("Menu -> ");
-      Serial.println(menuItems[menuIndex].label);
-    }
+      if (left && menuIndex > 0) {
+        lastMenuIndex = menuIndex;
+        menuIndex--;
+        animDirection = -1;
+        animOffsetX   = -128;
+        isAnimating   = true;
+        displayDirty  = true;
 
-    if (left && menuIndex > 0) {
+        Serial.print("Menu -> ");
+        Serial.println(menuItems[menuIndex].label);
+      }
 
-      menuIndex--;
-      displayDirty = true;
+      if (confirm) {
+        currentState = menuItems[menuIndex].targetState;
+        displayDirty = true;
 
-      Serial.print("Menu -> ");
-      Serial.println(menuItems[menuIndex].label);
-    }
+        Serial.print("Open: ");
+        Serial.println(menuItems[menuIndex].label);
+      }
 
-    if (confirm) {
+      if (back) {
+        currentState = STATE_HOME;
+        displayDirty = true;
 
-      currentState = menuItems[menuIndex].targetState;
-      displayDirty = true;
-
-      Serial.print("Open: ");
-      Serial.println(menuItems[menuIndex].label);
-    }
-
-    if (back) {
-
-      currentState = STATE_HOME;
-      displayDirty = true;
-
-      Serial.println("-> HOME");
+        Serial.println("-> HOME");
+      }
     }
   }
 
@@ -1100,8 +1151,8 @@ void loop() {
     // ---- Hold-based exponential adjustment ----
     // Step starts at 1, doubles every 600ms of holding
 
-    // RIGHT held
-    if (!digitalRead(RIGHT_BTN)) {
+    // RIGHT held (Debounced)
+    if (buttonState[BTN_RIGHT]) {
 
       if (inactRightStart == 0) {
         inactRightStart = millis();
@@ -1131,8 +1182,8 @@ void loop() {
       inactRightStart = 0;
     }
 
-    // LEFT held
-    if (!digitalRead(LEFT_BTN)) {
+    // LEFT held (Debounced)
+    if (buttonState[BTN_LEFT]) {
 
       if (inactLeftStart == 0) {
         inactLeftStart  = millis();
@@ -1198,6 +1249,30 @@ void loop() {
 
       Serial.println("-> MENU");
     }
+  }
+
+  // ====================================================
+  // MENU ANIMATION TICKER
+  // ====================================================
+
+  if (isAnimating && millis() - lastAnimFrameTime >= ANIM_FRAME_MS) {
+
+    lastAnimFrameTime = millis();
+
+    if (animDirection == 1) { // Moving Right (New comes from right)
+      animOffsetX -= ANIM_STEP_PX;
+      if (animOffsetX <= 0) {
+        animOffsetX = 0;
+        isAnimating = false;
+      }
+    } else { // Moving Left (New comes from left)
+      animOffsetX += ANIM_STEP_PX;
+      if (animOffsetX >= 0) {
+        animOffsetX = 0;
+        isAnimating = false;
+      }
+    }
+    displayDirty = true;
   }
 
   // ====================================================

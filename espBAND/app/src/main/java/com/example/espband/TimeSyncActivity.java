@@ -48,13 +48,24 @@ public class TimeSyncActivity extends AppCompatActivity {
         public void run() {
             sendCurrentTrackToBle();
             sendTimeToBle();
+            
+            // Send date every 5 seconds
+            if (counter % 5 == 0) {
+                sendDateToBle();
+            }
+            
             handler.postDelayed(this, 1000); // 1 second interval
         }
     };
 
     private void sendTimeToBle() {
         String currentTime = new SimpleDateFormat("hh:mm a", Locale.getDefault()).format(new Date());
-        BleManager.getInstance().sendData(currentTime, UUID.fromString("3bf4d21b-645f-4c68-9ff2-f42b35ec4a41"), UUID.fromString("ef95cac9-9cf2-4d9a-ace4-4f6d6b66d74b"));
+        BleManager.getInstance().sendData(currentTime, BleManager.TIME_SERVICE_UUID, BleManager.TIME_CHAR_UUID);
+    }
+
+    private void sendDateToBle() {
+        String currentDate = new SimpleDateFormat("MMM dd, yyyy", Locale.getDefault()).format(new Date());
+        BleManager.getInstance().sendData(currentDate, BleManager.DATE_SERVICE_UUID, BleManager.DATE_CHAR_UUID);
     }
 
     @Override
@@ -83,6 +94,9 @@ public class TimeSyncActivity extends AppCompatActivity {
         // Listen for control commands
         BleManager.getInstance().enableNotifications(serviceUuid, BleManager.CONTROL_CHAR_UUID);
         
+        // Initial sync
+        sendDateToBle();
+        
         handler.post(syncRunnable);
         refreshTrack();
     }
@@ -99,9 +113,17 @@ public class TimeSyncActivity extends AppCompatActivity {
         android.media.session.MediaController.TransportControls transport = activeController.getTransportControls();
         if (cmd.startsWith("PP")) {
             Log.d("DEBUG_CONTROL", "Dispatching Play/Pause");
-            transport.playFromSearch(null, null); // Often helps to trigger active session
-            transport.play(); // Fallback
-            transport.pause(); // Toggle
+            if (activeController.getPlaybackState() != null) {
+                int state = activeController.getPlaybackState().getState();
+                if (state == android.media.session.PlaybackState.STATE_PLAYING) {
+                    transport.pause();
+                } else {
+                    transport.play();
+                }
+            } else {
+                // Fallback if state is unknown
+                transport.playFromSearch(null, null);
+            }
         } else if (cmd.startsWith("NX")) {
             Log.d("DEBUG_CONTROL", "Dispatching Next");
             transport.skipToNext();
